@@ -98,6 +98,9 @@ macro_rules! prec_climber {
     };
 }
 
+pub type ClimbErr = String;
+pub type ClimbResult<T> = Result<T, ClimbErr>;
+
 /// Associativity of an [`Operator`].
 ///
 /// [`Operator`]: struct.Operator.html
@@ -107,6 +110,21 @@ pub enum Assoc {
     Left,
     /// Right `Operator` associativity
     Right,
+    /// Prefix `Operator` associativity
+    Prefix,
+    /// Postfix `Operator` associativity
+    Postfix,
+}
+
+impl Assoc
+{
+    pub fn next_prec(self, prec: u32) -> u32
+    {
+        match self {
+            Assoc::Left => prec + 1,
+            _ => prec,
+        }
+    }
 }
 
 /// Infix operator used in [`PrecClimber`].
@@ -159,6 +177,13 @@ impl<R: RuleType> BitOr for Operator<R> {
         assign_next(&mut self, rhs);
         self
     }
+}
+
+pub enum Reduction<'i, R, T> {
+    Primary(Pair<'i, R>),
+    Prefix(Pair<'i, R>, T),
+    Postfix(T, Pair<'i, R>),
+    Infix(T, Pair<'i, R>, T),
 }
 
 /// List of operators and precedences, which can perform [precedence climbing][1] on infix
@@ -264,6 +289,108 @@ impl<R: RuleType> PrecClimber<R> {
         PrecClimber {
             ops: Cow::Owned(ops),
         }
+    }
+
+    pub fn climb_fix<'i, P, F, T>(&self, pairs: P, mut reducer: F) -> ClimbResult<T>
+    where
+        P: Iterator<Item = Pair<'i, R>>,
+        F: FnMut(Reduction<'i, R, T>) -> ClimbResult<T>,
+    {
+        self.pre_climb(0, &mut pairs.peekable(), &mut reducer)
+    }
+
+    fn prefix_prec(&self, rule: R) -> Option<u32>
+    {
+        self.ops
+            .iter()
+            .find(|(r, _, assoc)| *r == rule && *assoc == Assoc::Prefix)
+            .map(|(_, precedence, _)| *precedence)
+    }
+
+    fn postfix_prec(&self, rule: R) -> Option<u32>
+    {
+        self.ops
+            .iter()
+            .find(|(r, _, assoc)| *r == rule && *assoc == Assoc::Postfix)
+            .map(|(_, precedence, _)| *precedence)
+    }
+
+    fn infix_prec(&self, rule: R) -> Option<(u32, Assoc)>
+    {
+        self.ops
+            .iter()
+            .find(|(r, _, assoc)| {
+                *r == rule && (*assoc == Assoc::Left || *assoc == Assoc::Right)
+            })
+            .map(|(_, precedence, assoc)| (*precedence, *assoc))
+    }
+
+    fn pre_climb<'i, P, F, T>(
+        &self,
+        min_prec: u32,
+        pairs: &mut Peekable<P>,
+        reducer: &mut F,
+    ) -> ClimbResult<T>
+    where
+        P: Iterator<Item = Pair<'i, R>>,
+        F: FnMut(Reduction<'i, R, T>) -> ClimbResult<T>,
+    {
+        let first = pairs
+                .next()
+                .expect("precedence climbing requires a non-empty Pairs");
+        match self.prefix_prec(first.as_rule()) {
+            Some(pre_prec) => {
+                if pre_prec < min_prec {
+                    reducer(Reduction::Primary(first))
+                } else {
+                    let mut peeks = pairs.peekable();
+                    let rhs = self.pre_climb(pre_prec, &mut peeks, reducer)?;
+                    reducer(Reduction::Prefix(first, rhs))
+                }
+            }
+            None => {
+                let lhs = reducer(Reduction::Primary(first))?;
+                let mut peeks = pairs.peekable();
+                self.post_climb(lhs, min_prec, &mut peeks, reducer)
+            }
+        }
+    }
+
+    fn post_climb<'i, P, F, T>(
+        &self,
+        mut lhs: T,
+        min_prec: u32,
+        pairs: &mut Peekable<P>,
+        reducer: &mut F,
+    ) -> ClimbResult<T>
+    where
+        P: Iterator<Item = Pair<'i, R>>,
+        F: FnMut(Reduction<'i, R, T>) -> ClimbResult<T>,
+    {
+        while pairs.peek().is_some() {
+            let rule = pairs.peek().unwrap().as_rule();
+            if let Some(post_prec) = self.postfix_prec(rule) {
+                if post_prec < min_prec {
+                    // postfix operator of lower precedence. stop here.
+                    break;
+                }
+                let next = pairs.next().unwrap();
+                lhs = reducer(Reduction::Postfix(lhs, next))?;
+            } else if let Some((in_prec, assoc)) = self.infix_prec(rule) {
+                if in_prec < min_prec {
+                    break;
+                }
+
+                let next_prec = assoc.next_prec(in_prec);
+                let op = pairs.next().unwrap();
+                let rhs = self.pre_climb(next_prec, pairs, reducer)?;
+                lhs = reducer(Reduction::Infix(lhs, op, rhs))?;
+            } else {
+                break;
+            }
+        }
+
+        Ok(lhs)
     }
 
     /// Performs the precedence climbing algorithm on the `pairs` in a similar manner to map-reduce.
